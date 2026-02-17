@@ -7,6 +7,7 @@
  *   SEKS_BROKER_TOKEN=seks_agent_xxx \
  *   seks-actuator [--id my-actuator] [--cwd /data/workspace]
  */
+import { hostname } from 'node:os';
 import { Actuator } from './actuator.js';
 
 function usage(): never {
@@ -68,7 +69,7 @@ const opts = parseArgs(process.argv.slice(2));
 const actuator = new Actuator({
   brokerUrl,
   agentToken,
-  actuatorId: opts.id,
+  actuatorId: opts.id ?? hostname(),
   capabilities: opts.capabilities,
   cwd: opts.cwd,
 });
