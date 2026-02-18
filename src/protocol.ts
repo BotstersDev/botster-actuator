@@ -1,23 +1,13 @@
 /**
  * Wire protocol types for actuator ↔ broker communication
+ * Must match seks-broker-2 (BotstersDev/botsters-broker) src/protocol.ts
  */
 
-// Actuator → Broker
-export interface ActuatorRegisterMessage {
-  type: 'actuator.register';
-  token: string;
-  actuatorId: string;
-  capabilities: string[];
-  metadata?: {
-    hostname?: string;
-    os?: string;
-    arch?: string;
-  };
-}
+// ─── Broker → Actuator ────────────────────────────────────────────────────────
 
-// Broker → Actuator
-export interface CommandRequestMessage {
-  type: 'command.request';
+/** Broker delivers a command for the actuator to execute */
+export interface CommandDelivery {
+  type: 'command_delivery';
   id: string;
   capability: string;
   payload: {
@@ -28,65 +18,64 @@ export interface CommandRequestMessage {
   };
 }
 
-// Actuator → Broker
-export interface CommandStdoutMessage {
-  type: 'command.stdout';
-  id: string;
-  data: string;
-}
-
-export interface CommandStderrMessage {
-  type: 'command.stderr';
-  id: string;
-  data: string;
-}
-
-export interface CommandDoneMessage {
-  type: 'command.done';
-  id: string;
-  exitCode: number;
-  durationMs: number;
-}
-
-export interface CommandErrorMessage {
-  type: 'command.error';
-  id: string;
-  error: string;
-}
-
-// Broker → Actuator
-export interface ActuatorRegisteredMessage {
-  type: 'actuator.registered';
-  actuatorId: string;
-}
-
-export interface ActuatorErrorMessage {
-  type: 'actuator.error';
-  error: string;
-  code?: string;
-}
-
-// Broker → Actuator: Ping/Pong for keepalive
+/** Broker keepalive ping */
 export interface PingMessage {
   type: 'ping';
   ts: number;
 }
 
+/** Broker error notification */
+export interface ErrorMessage {
+  type: 'error';
+  code: string;
+  message: string;
+  ref_id?: string;
+}
+
+export type ActuatorInbound = CommandDelivery | PingMessage | ErrorMessage;
+
+// ─── Actuator → Broker ────────────────────────────────────────────────────────
+
+/** Command execution result (batched — sent after completion) */
+export interface CommandResult {
+  type: 'command_result';
+  id: string;
+  status: 'completed' | 'failed';
+  result: {
+    stdout?: string;
+    stderr?: string;
+    exitCode?: number;
+    durationMs?: number;
+    error?: string;
+  };
+}
+
+/** Keepalive pong */
 export interface PongMessage {
   type: 'pong';
   ts: number;
 }
 
-export type ActuatorOutbound =
-  | ActuatorRegisterMessage
-  | CommandStdoutMessage
-  | CommandStderrMessage
-  | CommandDoneMessage
-  | CommandErrorMessage
-  | PongMessage;
+export type ActuatorOutbound = CommandResult | PongMessage;
 
-export type ActuatorInbound =
-  | CommandRequestMessage
-  | ActuatorRegisteredMessage
-  | ActuatorErrorMessage
-  | PingMessage;
+// ─── Future: Streaming (not yet implemented) ──────────────────────────────────
+// When streaming is added, these will be sent incrementally instead of batching:
+//
+// export interface CommandStdout {
+//   type: 'command_stdout';
+//   id: string;
+//   data: string;
+// }
+//
+// export interface CommandStderr {
+//   type: 'command_stderr';
+//   id: string;
+//   data: string;
+// }
+//
+// export interface CommandDone {
+//   type: 'command_done';
+//   id: string;
+//   exitCode: number;
+//   durationMs: number;
+// }
