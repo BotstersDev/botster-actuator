@@ -6,6 +6,17 @@ import WebSocket from 'ws';
 import { hostname } from 'node:os';
 import { ReconnectManager } from './reconnect.js';
 import { executeShell } from './executors/shell.js';
+import { createFileExecutor } from './executors/files.js';
+import { createProcessHandler } from './executors/process-handler.js';
+import type { 
+  CommandDelivery, 
+  ExecPayload, 
+  ProcessPayload, 
+  ReadPayload, 
+  WritePayload, 
+  EditPayload,
+  CommandResult 
+} from './protocol.js';
 
 export interface ActuatorConfig {
   brokerUrl: string;       // e.g. https://broker-internal.seksbot.com
@@ -15,27 +26,10 @@ export interface ActuatorConfig {
   cwd?: string;            // default working directory for commands
 }
 
-// Broker protocol types (matches protocol.ts in botsters-broker)
-interface CommandDelivery {
-  type: 'command_delivery';
-  id: string;
-  capability: string;
-  payload: unknown;
-}
+// Import protocol types
+import type { ActuatorInbound, PingMessage, ErrorMessage } from './protocol.js';
 
-interface PingMessage {
-  type: 'ping';
-  ts: number;
-}
-
-interface ErrorMessage {
-  type: 'error';
-  code: string;
-  message: string;
-  ref_id?: string;
-}
-
-type InboundMessage = CommandDelivery | PingMessage | ErrorMessage;
+type InboundMessage = ActuatorInbound;
 
 export class Actuator {
   private ws: WebSocket | null = null;
@@ -43,10 +37,14 @@ export class Actuator {
   private activeCommands = new Map<string, () => void>(); // id → kill fn
   private destroyed = false;
   private readonly cwd: string;
+  private readonly fileExecutor;
+  private readonly processHandler;
 
   constructor(private config: ActuatorConfig) {
     this.cwd = config.cwd ?? process.cwd();
     this.reconnect = new ReconnectManager();
+    this.fileExecutor = createFileExecutor(this.cwd);
+    this.processHandler = createProcessHandler();
   }
 
   start(): void {
@@ -120,63 +118,175 @@ export class Actuator {
     }
   }
 
-  private handleCommand(msg: CommandDelivery): void {
+  private async handleCommand(msg: CommandDelivery): Promise<void> {
     const { id, capability, payload } = msg;
-    const cmd = payload as { command?: string; cwd?: string; timeout?: number; env?: Record<string, string> };
 
     console.log(`[actuator] Command ${id}: ${capability}`);
 
-    if (capability === 'actuator/shell' || capability === 'shell') {
-      if (!cmd.command) {
-        this.send({ type: 'command_result', id, status: 'failed', result: { error: 'No command specified' } });
-        return;
-      }
+    switch (capability) {
+      case 'exec':
+        await this.handleExecCommand(id, payload as ExecPayload);
+        break;
+      
+      case 'process':
+        this.handleProcessCommand(id, payload as ProcessPayload);
+        break;
+      
+      case 'read':
+        this.handleReadCommand(id, payload as ReadPayload);
+        break;
+      
+      case 'write':
+        this.handleWriteCommand(id, payload as WritePayload);
+        break;
+      
+      case 'edit':
+        this.handleEditCommand(id, payload as EditPayload);
+        break;
+      
+      // Legacy support for old capability names
+      case 'actuator/shell':
+      case 'shell':
+        const legacyPayload = payload as { command?: string; cwd?: string; timeout?: number; env?: Record<string, string> };
+        if (legacyPayload.command) {
+          await this.handleExecCommand(id, { command: legacyPayload.command, cwd: legacyPayload.cwd, timeout: legacyPayload.timeout, env: legacyPayload.env });
+        } else {
+          this.sendResult(id, 'failed', { error: 'No command specified' });
+        }
+        break;
+      
+      default:
+        this.sendResult(id, 'failed', { error: `Unsupported capability: ${capability}` });
+    }
+  }
 
-      let stdout = '';
-      let stderr = '';
+  private async handleExecCommand(id: string, payload: ExecPayload): Promise<void> {
+    if (!payload.command) {
+      this.sendResult(id, 'failed', { error: 'No command specified' });
+      return;
+    }
 
-      const kill = executeShell(
+    let stdout = '';
+    let stderr = '';
+
+    try {
+      const session = await executeShell(
         {
-          command: cmd.command,
-          cwd: cmd.cwd ?? this.cwd,
-          timeout: cmd.timeout,
-          env: cmd.env,
+          command: payload.command,
+          cwd: payload.cwd ?? this.cwd,
+          timeout: payload.timeout,
+          env: payload.env,
+          pty: payload.pty,
+          background: payload.background,
+          yieldMs: payload.yieldMs,
         },
         {
           onStdout: (data) => { stdout += data; },
           onStderr: (data) => { stderr += data; },
-          onDone: (exitCode, durationMs) => {
+          onDone: (exitCode, durationMs, session) => {
             this.activeCommands.delete(id);
-            this.send({
-              type: 'command_result',
-              id,
-              status: exitCode === 0 ? 'completed' : 'failed',
-              result: { stdout, stderr, exitCode, durationMs },
+            this.sendResult(id, exitCode === 0 ? 'completed' : 'failed', {
+              stdout,
+              stderr,
+              exitCode,
+              durationMs,
+              sessionId: session?.id,
+              pid: session?.pid
             });
           },
-          onError: (error) => {
+          onError: (error, session) => {
             this.activeCommands.delete(id);
-            this.send({
-              type: 'command_result',
-              id,
-              status: 'failed',
-              result: { error, stdout, stderr },
+            this.sendResult(id, 'failed', {
+              error,
+              stdout,
+              stderr,
+              sessionId: session?.id,
+              pid: session?.pid
             });
           },
+          onYield: (session) => {
+            // Command yielded to background, return 'running' status
+            this.sendResult(id, 'running', {
+              sessionId: session.id,
+              pid: session.pid,
+              stdout,
+              stderr
+            });
+          }
         }
       );
-      this.activeCommands.set(id, kill);
-    } else {
-      this.send({
-        type: 'command_result',
-        id,
-        status: 'failed',
-        result: { error: `Unsupported capability: ${capability}` },
+
+      // Set up kill function for this session
+      this.activeCommands.set(id, () => {
+        if (session.pid && !session.exited) {
+          try {
+            process.kill(session.pid, 'SIGTERM');
+          } catch (err) {
+            // Process might have already exited
+          }
+        }
       });
+
+    } catch (err) {
+      this.sendResult(id, 'failed', { error: `Failed to execute command: ${(err as Error).message}` });
     }
   }
 
-  private send(msg: Record<string, unknown>): void {
+  private handleProcessCommand(id: string, payload: ProcessPayload): void {
+    const result = this.processHandler.handle(payload);
+    
+    if (result.success) {
+      this.sendResult(id, 'completed', {
+        sessions: result.sessions,
+        tail: result.tail,
+        content: result.output
+      });
+    } else {
+      this.sendResult(id, 'failed', { error: result.error });
+    }
+  }
+
+  private handleReadCommand(id: string, payload: ReadPayload): void {
+    const result = this.fileExecutor.read(payload);
+    
+    if (result.success) {
+      this.sendResult(id, 'completed', { content: result.content });
+    } else {
+      this.sendResult(id, 'failed', { error: result.error });
+    }
+  }
+
+  private handleWriteCommand(id: string, payload: WritePayload): void {
+    const result = this.fileExecutor.write(payload);
+    
+    if (result.success) {
+      this.sendResult(id, 'completed', {});
+    } else {
+      this.sendResult(id, 'failed', { error: result.error });
+    }
+  }
+
+  private handleEditCommand(id: string, payload: EditPayload): void {
+    const result = this.fileExecutor.edit(payload);
+    
+    if (result.success) {
+      this.sendResult(id, 'completed', {});
+    } else {
+      this.sendResult(id, 'failed', { error: result.error });
+    }
+  }
+
+  private sendResult(id: string, status: 'completed' | 'failed' | 'running', result: any): void {
+    const commandResult: CommandResult = {
+      type: 'command_result',
+      id,
+      status,
+      result
+    };
+    this.send(commandResult);
+  }
+
+  private send(msg: Record<string, unknown> | CommandResult): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg));
     }
